@@ -46,6 +46,7 @@ textarea,input,select{font-family:inherit;outline:none}
 <body>
 <div id="app"><div class="page gbg"><div class="spinner"></div></div></div>
 <div id="toast"></div>
+<audio id="ao" preload="auto" playsinline style="display:none"></audio>
 
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
@@ -173,7 +174,7 @@ async function loadAll(){
     clearListeners();
     _unsubs.push(db.collection("flashcard").doc(DOC_CARDS).onSnapshot(function(doc){
       if(!doc.exists)return;
-      if(S.screen==="add"||S.screen==="study")return;
+      if(S.screen==="add"||S.screen==="study"||S.screen==="audio")return;
       S.cards=(doc.data().cards||[]).map(function(c){
         var subj=c.subject==="민법"?"민사법":(c.subject||"민사법");
         return Object.assign({},c,{subject:subj});
@@ -444,7 +445,7 @@ function renderSubjectSelect(mode){
       var sc=SUBJ_COLOR[s];var d=stats.bySubject[s]||{total:0,due:0};
       var info=mode==="study"?"복습 "+d.due+"문제":"전체 "+d.total+"개";
       return el("button",{className:"subj-btn",style:{background:sc[0],color:sc[1],cursor:"pointer",border:"none"},onClick:function(){
-        if(mode==="study")startStudy(s,false);else startMemo(s,false);
+        if(mode==="study")startStudy(s,false);else if(S.memoMode==="audio")startAudio(s,false);else startMemo(s,false);
       }},[
         el("div",{style:{fontSize:"28px"}},SUBJ_ICON[s]),
         el("div",{style:{fontSize:"15px",fontWeight:"800"}},s),
@@ -457,7 +458,7 @@ function renderSubjectSelect(mode){
     SUBJECTS.map(function(s){
       var sc=SUBJ_COLOR[s];
       return el("button",{style:{flex:"1",background:"#fff",border:"1px solid "+sc[0],borderRadius:"12px",padding:"8px 4px",fontSize:"12px",fontWeight:"700",color:sc[1],cursor:"pointer"},onClick:function(){
-        if(mode==="study")startStudy(s,true);else startMemo(s,true);
+        if(mode==="study")startStudy(s,true);else if(S.memoMode==="audio")startAudio(s,true);else startMemo(s,true);
       }},"⭐ "+s);
     })
   );
@@ -466,6 +467,7 @@ function renderSubjectSelect(mode){
       el("button",{style:{background:"#f1f5f9",border:"none",borderRadius:"10px",padding:"8px 14px",fontSize:"13px",fontWeight:"700",cursor:"pointer"},onClick:function(){set({screen:"home"})}},"← 뒤로"),
       el("h2",{style:{fontSize:"18px",fontWeight:"800",color:"#1e293b",flex:"1"}},title)
     ]),
+    mode==="memo"?renderMemoModeToggle():null,
     p("과목을 선택하세요",{fontSize:"13px",color:"#64748b",marginBottom:"14px"}),
     subjBtns,
     el("div",{style:{fontSize:"11px",color:"#94a3b8",marginBottom:"8px",textAlign:"center"}},"⭐ 북마크 모아보기"),
@@ -475,7 +477,289 @@ function renderSubjectSelect(mode){
   return div("page gbg",[card]);
 }
 
+// ══════════════════════════════════════════════════════════════
+// 🌙 AUDIO ONLY 모드
+//  - 카드 앞면+뒷면+해설(링크 제외)을 Azure TTS로 읽어 MP3 하나로 이어 붙여 재생
+//  - 하나의 오디오 파일이므로 화면이 꺼져도 계속 재생되고, 타이머 길이에서 끝남
+//  - 합성한 음성은 Firestore(tts_audio 컬렉션)에 저장해 모든 기기에서 재사용
+// ══════════════════════════════════════════════════════════════
+var AUDIO_PREF_KEY="law_fc_audio_pref";
+var MEMO_MODE_KEY="law_fc_memo_mode";
+var TTS_COL="tts_audio";
+var TTS_VOICE="ko-KR-SunHiNeural";
+var TTS_FMT="audio-24khz-48kbitrate-mono-mp3";
+function loadAudioPref(){var d={timer:30,gapQA:3,gapCard:2,rate:0.9,exp:true,showText:true};try{return Object.assign(d,JSON.parse(localStorage.getItem(AUDIO_PREF_KEY)||"{}"))}catch(e){return d}}
+function saveAudioPref(){try{localStorage.setItem(AUDIO_PREF_KEY,JSON.stringify(AP))}catch(e){}}
+var AP=loadAudioPref();
+S.memoMode=(function(){try{return localStorage.getItem(MEMO_MODE_KEY)||"text"}catch(e){return"text"}})();
+function setMemoMode(m){S.memoMode=m;try{localStorage.setItem(MEMO_MODE_KEY,m)}catch(e){}render()}
+
+// ── 읽기용 텍스트 정리
+function ttsClean(s){
+  s=String(s||"");
+  s=s.replace(/https?:\/\/\S+/g,"").replace(/www\.\S+/g,"");
+  var map={"判例":"판례","判":"판","甲":"갑","乙":"을","丙":"병","丁":"정","戊":"무","己":"기"};
+  s=s.replace(/判例|[判甲乙丙丁戊己]/g,function(m){return map[m]});
+  s=s.replace(/[①-⑳]/g,function(c){return " "+(c.charCodeAt(0)-0x2460+1)+". "});
+  s=s.replace(/[⓵-⓾]/g,function(c){return " "+(c.charCodeAt(0)-0x24F5+1)+". "});
+  s=s.replace(/[→⇒]/g,", ").replace(/[·•]/g,", ").replace(/\(\s*\)/g,"").replace(/\"\s*\"/g," 빈칸 ");
+  s=s.replace(/\r/g,"").replace(/[ \t]+/g," ").replace(/\n{2,}/g,"\n").trim();
+  return s;
+}
+function ttsAnswer(a){var t=String(a||"").trim();if(/^[Oo○◯]$/.test(t))return"오. 맞는 지문.";if(/^[Xx×✕]$/.test(t))return"엑스. 틀린 지문.";return ttsClean(t)}
+function ssmlText(s){return escXml(s).replace(/\n+/g,'<break time="400ms"/>')}
+
+// ── Azure (토큰 재사용)
+var _azTok=null,_azTokAt=0;
+async function azureToken(){
+  if(_azTok&&Date.now()-_azTokAt<8*60*1000)return _azTok;
+  var r=await fetch("https://"+AZURE_REGION+".api.cognitive.microsoft.com/sts/v1.0/issueToken",{method:"POST",headers:{"Ocp-Apim-Subscription-Key":AZURE_KEY}});
+  if(!r.ok)throw new Error("Azure 인증 실패 ("+r.status+")");
+  _azTok=await r.text();_azTokAt=Date.now();return _azTok;
+}
+async function azureSynth(inner,rate){
+  var ssml='<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="ko-KR"><voice name="'+TTS_VOICE+'"><prosody rate="'+rate+'">'+inner+'</prosody></voice></speak>';
+  for(var i=0;i<5;i++){
+    var tok=await azureToken();
+    var r=await fetch("https://"+AZURE_REGION+".tts.speech.microsoft.com/cognitiveservices/v1",{method:"POST",headers:{"Authorization":"Bearer "+tok,"Content-Type":"application/ssml+xml","X-Microsoft-OutputFormat":TTS_FMT},body:ssml});
+    if(r.ok)return new Uint8Array(await r.arrayBuffer());
+    if(r.status===401){_azTok=null;continue}
+    if(r.status===429||r.status>=500){await new Promise(function(res){setTimeout(res,1500*(i+1))});continue}
+    throw new Error("Azure 음성 오류 ("+r.status+")");
+  }
+  throw new Error("Azure 요청이 계속 실패했습니다");
+}
+
+// ── 서버(Firestore) 캐시
+var _fsOK=true,_fsWarned=false;
+async function sha(s){var b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(function(x){return x.toString(16).padStart(2,"0")}).join("").slice(0,40)}
+function fsFail(e){if(e&&(e.code==="permission-denied"||/permission/i.test(e.message||""))){_fsOK=false;if(!_fsWarned){_fsWarned=true;toast("⚠️ 서버 저장 권한 없음 — 이번엔 저장 없이 재생")}}}
+async function getClip(inner,rate,stat){
+  var id=await sha(TTS_VOICE+"|"+rate+"|"+inner);
+  if(_fsOK){
+    try{var snap=await db.collection(TTS_COL).doc(id).get();if(snap.exists&&snap.data().mp3){stat.server++;return snap.data().mp3.toUint8Array()}}catch(e){fsFail(e)}
+  }
+  var u8=await azureSynth(inner,rate);stat.azure++;
+  if(_fsOK&&u8.length<1000000){
+    db.collection(TTS_COL).doc(id).set({mp3:firebase.firestore.Blob.fromUint8Array(u8),voice:TTS_VOICE,rate:rate,bytes:u8.length,createdAt:firebase.firestore.FieldValue.serverTimestamp()}).catch(fsFail);
+  }
+  return u8;
+}
+
+// ── MP3 프레임 파싱 (ID3·Xing 헤더 제거 → 안전하게 이어 붙이기 + 정확한 길이 계산)
+var MP3_BR1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],MP3_BR2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160];
+var MP3_SR={3:[44100,48000,32000],2:[22050,24000,16000],0:[11025,12000,8000]};
+function parseMp3(u){
+  var p=0,frames=[],secs=0;
+  if(u[0]===0x49&&u[1]===0x44&&u[2]===0x33){p=10+((u[6]&127)<<21|(u[7]&127)<<14|(u[8]&127)<<7|(u[9]&127));if(u[5]&0x10)p+=10}
+  while(p+4<=u.length){
+    if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0){p++;continue}
+    var ver=(u[p+1]>>3)&3,layer=(u[p+1]>>1)&3,bri=u[p+2]>>4,sri=(u[p+2]>>2)&3,pad=(u[p+2]>>1)&1,mono=(u[p+3]>>6)===3;
+    if(ver===1||layer!==1||bri===0||bri===15||sri===3){p++;continue}
+    var mp1=ver===3,br=(mp1?MP3_BR1:MP3_BR2)[bri]*1000,sr=MP3_SR[ver][sri];
+    var len=Math.floor((mp1?144:72)*br/sr)+pad;if(len<5||p+len>u.length)break;
+    var t=p+4+(mp1?(mono?17:32):(mono?9:17));
+    var tag=String.fromCharCode(u[t],u[t+1],u[t+2],u[t+3]);
+    var hdr=tag==="Xing"||tag==="Info"||String.fromCharCode(u[p+36],u[p+37],u[p+38],u[p+39])==="VBRI";
+    if(!hdr){frames.push(u.subarray(p,p+len));secs+=(mp1?1152:576)/sr}
+    p+=len;
+  }
+  return{frames:frames,secs:secs};
+}
+
+// ── 오디오 엘리먼트 (#app 밖에 고정 → 화면 다시 그려도 재생 유지)
+var AO=document.getElementById("ao");
+function silentWav(){var n=2400,b=new ArrayBuffer(44+n*2),v=new DataView(b),w=function(o,s){for(var i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};w(0,"RIFF");v.setUint32(4,36+n*2,true);w(8,"WAVEfmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,24000,true);v.setUint32(28,48000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,"data");v.setUint32(40,n*2,true);return URL.createObjectURL(new Blob([b],{type:"audio/wav"}))}
+function unlockAudio(){try{if(!AO.src||AO.dataset.kind!=="main"){AO.dataset.kind="unlock";AO.src=silentWav();var pr=AO.play();if(pr&&pr.catch)pr.catch(function(){})}}catch(e){}}
+function fmtTime(s){s=Math.max(0,Math.round(s));var m=Math.floor(s/60),x=s%60;return m+":"+String(x).padStart(2,"0")}
+function shuffleArr(a){a=a.slice();for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t}return a}
+
+function startAudio(subject,starOnly){
+  var pool=S.cards.filter(function(c){return(c.subject||"민법")===subject});
+  if(starOnly)pool=pool.filter(function(c){return c.starred});
+  if(!pool.length){toast(starOnly?"⭐ 북마크된 카드가 없습니다!":"문제가 없습니다.");return}
+  set({screen:"audio",audio:{subject:subject,starOnly:!!starOnly,pool:pool,state:"setup",run:0}});
+}
+function stopAudioPlayback(){
+  try{AO.pause()}catch(e){}
+  var A=S.audio;if(A&&A.url){URL.revokeObjectURL(A.url);A.url=null}
+  AO.removeAttribute("src");AO.dataset.kind="";try{AO.load()}catch(e){}
+  if("mediaSession"in navigator){try{navigator.mediaSession.metadata=null;navigator.mediaSession.playbackState="none"}catch(e){}}
+}
+function exitAudio(){if(S.audio)S.audio.run++;stopAudioPlayback();set({screen:"subjectMemo",audio:null})}
+
+async function buildAudio(){
+  var A=S.audio;if(!A)return;
+  var run=++A.run;
+  stopAudioPlayback();unlockAudio(); // 사용자 탭 시점에 오디오 잠금 해제 (iOS)
+  A.state="building";A.done=0;A.secs=0;A.err=null;render();
+  var target=AP.timer*60,rate=AP.rate,stat={server:0,azure:0};
+  try{
+    var sil=parseMp3(await getClip('<break time="1000ms"/>',rate,stat));
+    var silFrames=function(sec){var out=[],t=0,n=Math.round(sec/Math.max(sil.secs,0.3));for(var i=0;i<n;i++){out.push.apply(out,sil.frames);t+=sil.secs}return{frames:out,secs:t}};
+    // 카드 한 장 = [문제] 간격 [정답] 1초 [해설]
+    var makeCard=async function(c){
+      var parts=[],secs=0;
+      var add=function(cl){parts.push.apply(parts,cl.frames);secs+=cl.secs};
+      var q=ttsClean(c.question),a=ttsAnswer(c.answer),x=AP.exp?ttsClean(c.explanation):"";
+      if(q)add(parseMp3(await getClip(ssmlText("문제. "+q),rate,stat)));
+      if(a){add(silFrames(AP.gapQA));add(parseMp3(await getClip(ssmlText("정답. "+a),rate,stat)))}
+      if(x){add(silFrames(1));add(parseMp3(await getClip(ssmlText("해설. "+x),rate,stat)))}
+      return{frames:parts,secs:secs};
+    };
+    var gap=silFrames(AP.gapCard);
+    var order=shuffleArr(A.pool),clips=new Map(),qi=0,acc=0;
+    var worker=async function(){
+      while(qi<order.length&&acc<target){
+        var c=order[qi++];
+        var cl=await makeCard(c);if(run!==A.run)return;
+        if(cl.frames.length){clips.set(c,cl);acc+=cl.secs+gap.secs}
+        A.done=clips.size;A.secs=acc;
+        var pe=document.getElementById("audProg");if(pe)pe.style.width=Math.min(100,acc/target*100)+"%";
+        var te=document.getElementById("audProgTxt");if(te)te.textContent=A.done+"장 준비 · "+fmtTime(Math.min(acc,target))+" / "+fmtTime(target);
+      }
+    };
+    await Promise.all([worker(),worker(),worker()]);
+    if(run!==A.run)return;
+    if(!clips.size)throw new Error("읽을 수 있는 카드가 없습니다");
+    // 이어 붙이기: 섞인 순서대로, 모자라면 다시 섞어서 반복
+    var out=[],segs=[],t=0,seq=order.filter(function(c){return clips.has(c)}),ready=seq.slice(),last=null;
+    while(t<target){
+      if(!seq.length){seq=shuffleArr(ready);if(seq.length>1&&seq[0]===last)seq.push(seq.shift())}
+      var c=seq.shift(),cl=clips.get(c);last=c;
+      segs.push({t0:t,t1:t+cl.secs,card:c});
+      out.push.apply(out,cl.frames);t+=cl.secs;
+      out.push.apply(out,gap.frames);t+=gap.secs;
+    }
+    var blob=new Blob(out,{type:"audio/mpeg"});
+    A.url=URL.createObjectURL(blob);A.segs=segs;A.total=t;A.cur=-1;A.stat=stat;A.unique=clips.size;
+    AO.dataset.kind="main";AO.src=A.url;
+    A.state="ready";render();setupAudioSession();
+    var pr=AO.play();if(pr&&pr.catch)pr.catch(function(){render()});
+  }catch(e){
+    if(run!==A.run)return;
+    console.error(e);A.state="setup";A.err=e.message||String(e);render();
+  }
+}
+
+function audSegAt(t){var A=S.audio;if(!A||!A.segs)return -1;var s=A.segs,lo=0,hi=s.length-1,r=-1;while(lo<=hi){var m=(lo+hi)>>1;if(s[m].t0<=t){r=m;lo=m+1}else hi=m-1}return r}
+function audJump(d){var A=S.audio;if(!A||!A.segs)return;var i=Math.max(0,Math.min(A.segs.length-1,audSegAt(AO.currentTime)+d));AO.currentTime=A.segs[i].t0+0.01}
+function audPrev(){var A=S.audio;if(!A||!A.segs)return;var i=audSegAt(AO.currentTime),s=A.segs[i];if(s&&AO.currentTime-s.t0>3)AO.currentTime=s.t0+0.01;else audJump(-1)}
+function audToggle(){if(AO.paused){var pr=AO.play();if(pr&&pr.catch)pr.catch(function(){})}else AO.pause()}
+function setupAudioSession(){
+  if(!("mediaSession"in navigator))return;
+  var ms=navigator.mediaSession;
+  [["play",function(){AO.play()}],["pause",function(){AO.pause()}],["nexttrack",function(){audJump(1)}],["previoustrack",audPrev],["seekforward",function(){audJump(1)}],["seekbackward",audPrev]].forEach(function(h){try{ms.setActionHandler(h[0],h[1])}catch(e){}});
+  updateAudioMeta();
+}
+function updateAudioMeta(){
+  var A=S.audio;if(!A||!("mediaSession"in navigator)||typeof MediaMetadata==="undefined")return;
+  var seg=A.segs&&A.cur>=0?A.segs[A.cur]:null;
+  try{navigator.mediaSession.metadata=new MediaMetadata({title:seg?ttsClean(seg.card.question).slice(0,80):"🌙 audio only",artist:SUBJ_ICON[A.subject]+" "+A.subject+(seg?" · "+(A.cur+1)+"번째":""),album:"법학 플래시카드"})}catch(e){}
+}
+function updateAudioDom(){
+  var A=S.audio;if(!A||S.screen!=="audio"||!A.segs)return;
+  var r=document.getElementById("audRemain");if(r)r.textContent=fmtTime(A.total-AO.currentTime);
+  var bar=document.getElementById("audBar");if(bar)bar.style.width=Math.min(100,AO.currentTime/A.total*100)+"%";
+  var i=audSegAt(AO.currentTime);
+  if(i!==A.cur){A.cur=i;updateAudioMeta();
+    var n=document.getElementById("audNum");if(n)n.textContent=(i+1)+"번째 카드";
+    var q=document.getElementById("audQ");if(q)q.textContent=i>=0&&AP.showText?A.segs[i].card.question:"";
+  }
+}
+AO.addEventListener("timeupdate",updateAudioDom);
+AO.addEventListener("play",function(){if(AO.dataset.kind==="main"&&S.screen==="audio"){if("mediaSession"in navigator)try{navigator.mediaSession.playbackState="playing"}catch(e){}render()}});
+AO.addEventListener("pause",function(){if(AO.dataset.kind==="main"&&S.screen==="audio"){if("mediaSession"in navigator)try{navigator.mediaSession.playbackState="paused"}catch(e){}render()}});
+AO.addEventListener("ended",function(){if(AO.dataset.kind==="main"&&S.audio){S.audio.state="ended";if("mediaSession"in navigator)try{navigator.mediaSession.playbackState="none"}catch(e){}render()}});
+
+// ── 🌙 화면
+function renderAudio(){
+  var A=S.audio;var sc=SUBJ_COLOR[A.subject]||["#fff","#333"];
+  var W="rgba(255,255,255,";
+  var chipRow=function(label,key,vals,fmt){
+    return el("div",{style:{marginBottom:"14px"}},[
+      p(label,{fontSize:"12px",color:W+".6)",marginBottom:"6px",fontWeight:"700"}),
+      el("div",{style:{display:"flex",gap:"6px",flexWrap:"wrap"}},vals.map(function(v){
+        var on=AP[key]===v;
+        return el("button",{style:{padding:"8px 13px",borderRadius:"99px",fontSize:"13px",fontWeight:"700",background:on?"#fde68a":W+".08)",color:on?"#1e1b4b":"#e2e8f0",border:"1px solid "+(on?"#fde68a":W+".15)")},onClick:function(){AP[key]=v;saveAudioPref();render()}},fmt(v));
+      }))
+    ]);
+  };
+  var top=el("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"18px"}},[
+    ghostBtn("✕ 종료",exitAudio),
+    el("div",{style:{display:"flex",alignItems:"center",gap:"6px"}},[
+      el("span",{style:{background:sc[0],color:sc[1],fontSize:"11px",fontWeight:"700",padding:"3px 10px",borderRadius:"99px"}},SUBJ_ICON[A.subject]+" "+A.subject+(A.starOnly?" ⭐":"")),
+      el("span",{style:{color:W+".7)",fontSize:"12px",fontWeight:"700"}},"🌙 audio only")
+    ])
+  ]);
+  var box=function(ch){return el("div",{style:{background:W+".06)",border:"1px solid "+W+".1)",borderRadius:"24px",padding:"22px"}},ch)};
+  var body;
+  if(A.state==="setup"){
+    body=box([
+      p("카드 "+A.pool.length+"장을 무작위로 읽어요",{color:"#fff",fontSize:"16px",fontWeight:"800",marginBottom:"4px"}),
+      p("문제 → 정답 → 해설 순서 · 링크는 읽지 않음",{color:W+".55)",fontSize:"12px",marginBottom:"18px"}),
+      chipRow("⏰ 자동 종료","timer",[10,20,30,45,60,90],function(v){return v+"분"}),
+      chipRow("🗣 말하기 속도","rate",[0.8,0.9,1.0,1.1,1.2],function(v){return v.toFixed(1)+"x"}),
+      chipRow("⏸ 문제 → 정답 사이","gapQA",[1,2,3,5,8],function(v){return v+"초"}),
+      chipRow("⏭ 카드 사이","gapCard",[1,2,3,5],function(v){return v+"초"}),
+      el("div",{style:{display:"flex",gap:"8px",marginBottom:"18px"}},[
+        el("button",{style:{flex:"1",padding:"10px",borderRadius:"14px",fontSize:"13px",fontWeight:"700",background:AP.exp?"#fde68a":W+".08)",color:AP.exp?"#1e1b4b":"#e2e8f0",border:"none"},onClick:function(){AP.exp=!AP.exp;saveAudioPref();render()}},(AP.exp?"✔ ":"")+"해설 읽기"),
+        el("button",{style:{flex:"1",padding:"10px",borderRadius:"14px",fontSize:"13px",fontWeight:"700",background:AP.showText?"#fde68a":W+".08)",color:AP.showText?"#1e1b4b":"#e2e8f0",border:"none"},onClick:function(){AP.showText=!AP.showText;saveAudioPref();render()}},(AP.showText?"✔ ":"")+"화면에 문제 표시")
+      ]),
+      A.err?p("⚠️ "+A.err,{color:"#fca5a5",fontSize:"13px",marginBottom:"12px"}):null,
+      btn("▶ 시작","#fde68a","#1e1b4b",buildAudio,{borderRadius:"16px",fontSize:"16px",padding:"15px"}),
+      p("시작 후 화면을 꺼도 계속 재생되고, 정한 시간이 되면 자동으로 멈춰요.",{color:W+".45)",fontSize:"11px",marginTop:"10px",textAlign:"center"})
+    ]);
+  }else if(A.state==="building"){
+    var target=AP.timer*60;
+    body=box([
+      el("div",{style:{fontSize:"40px",textAlign:"center",marginBottom:"8px"}},"🎙️"),
+      p("음성 준비 중…",{color:"#fff",fontSize:"16px",fontWeight:"800",textAlign:"center",marginBottom:"14px"}),
+      el("div",{style:{background:W+".1)",borderRadius:"99px",height:"8px",overflow:"hidden"}},[el("div",{id:"audProg",style:{background:"#fde68a",height:"8px",width:Math.min(100,(A.secs||0)/target*100)+"%",transition:"width .3s"}})]),
+      p((A.done||0)+"장 준비 · "+fmtTime(Math.min(A.secs||0,target))+" / "+fmtTime(target),{color:W+".6)",fontSize:"12px",textAlign:"center",marginTop:"8px"}),
+      p("처음 듣는 카드는 새로 만들고, 한 번 만든 음성은 서버에서 바로 불러와요.",{color:W+".4)",fontSize:"11px",textAlign:"center",marginTop:"14px"})
+    ]);
+    body.querySelectorAll("p")[1].id="audProgTxt";
+  }else{
+    var playing=!AO.paused&&A.state!=="ended";
+    var cur=audSegAt(AO.currentTime);A.cur=cur;
+    var ctrl=function(t,fn,big){return el("button",{style:{width:big?"76px":"56px",height:big?"76px":"56px",borderRadius:"50%",background:big?"#fde68a":W+".1)",color:big?"#1e1b4b":"#fff",fontSize:big?"30px":"20px",border:"none",display:"flex",alignItems:"center",justifyContent:"center"},onClick:fn},t)};
+    body=box(A.state==="ended"?[
+      el("div",{style:{fontSize:"48px",textAlign:"center",marginBottom:"8px"}},"⏰"),
+      p("타이머 종료",{color:"#fff",fontSize:"20px",fontWeight:"800",textAlign:"center",marginBottom:"6px"}),
+      p(A.segs.length+"장 들었어요",{color:W+".55)",fontSize:"13px",textAlign:"center",marginBottom:"18px"}),
+      btn("🔀 다시 섞어서 듣기","#fde68a","#1e1b4b",buildAudio,{borderRadius:"16px",marginBottom:"8px"}),
+      btn("⚙️ 설정 바꾸기",W+".1)","#fff",function(){stopAudioPlayback();A.state="setup";render()},{borderRadius:"16px",fontSize:"13px"})
+    ]:[
+      p("남은 시간",{color:W+".5)",fontSize:"12px",textAlign:"center",fontWeight:"700"}),
+      el("div",{id:"audRemain",style:{color:"#fff",fontSize:"52px",fontWeight:"800",textAlign:"center",letterSpacing:"1px",fontVariantNumeric:"tabular-nums",margin:"2px 0 10px"}},fmtTime(A.total-AO.currentTime)),
+      el("div",{style:{background:W+".1)",borderRadius:"99px",height:"4px",overflow:"hidden",marginBottom:"18px"}},[el("div",{id:"audBar",style:{background:"#fde68a",height:"4px",width:Math.min(100,AO.currentTime/A.total*100)+"%"}})]),
+      p(cur>=0?(cur+1)+"번째 카드":"",{color:"#fde68a",fontSize:"12px",fontWeight:"700",textAlign:"center",marginBottom:"6px"}),
+      p(cur>=0&&AP.showText?A.segs[cur].card.question:"",{color:W+".75)",fontSize:"14px",lineHeight:"1.6",textAlign:"center",minHeight:"46px",marginBottom:"20px",whiteSpace:"pre-wrap"}),
+      el("div",{style:{display:"flex",alignItems:"center",justifyContent:"center",gap:"22px",marginBottom:"20px"}},[ctrl("⏮",audPrev),ctrl(playing?"⏸":"▶",audToggle,true),ctrl("⏭",function(){audJump(1)})]),
+      el("div",{style:{display:"flex",gap:"8px"}},[
+        btn("🔀 다시 섞기",W+".1)","#fff",buildAudio,{flex:"1",borderRadius:"14px",fontSize:"13px",padding:"11px"}),
+        btn("⚙️ 설정",W+".1)","#fff",function(){stopAudioPlayback();A.state="setup";render()},{flex:"1",borderRadius:"14px",fontSize:"13px",padding:"11px"})
+      ]),
+      p("화면을 꺼도 계속 재생돼요 · 잠금화면에서 ⏮ ⏭ 가능",{color:W+".4)",fontSize:"11px",textAlign:"center",marginTop:"12px"}),
+      A.stat?p("음성 "+A.unique+"장 · 서버 "+A.stat.server+" / 새로 생성 "+A.stat.azure,{color:W+".25)",fontSize:"10px",textAlign:"center",marginTop:"4px"}):null
+    ]);
+    if(A.state!=="ended"){var ps=body.querySelectorAll("p");ps[1].id="audNum";ps[2].id="audQ";}
+  }
+  return div("page",[el("div",{style:{width:"100%",maxWidth:"480px",margin:"auto"}},[top,body])],{background:"linear-gradient(160deg,#0b1026,#1e1b4b 60%,#312e81)"});
+}
+
 // ── 화면들
+function renderMemoModeToggle(){
+  var opts=[["text","☀️","with text","카드 보면서 학습"],["audio","🌙","audio only","화면 끄고 듣기"]];
+  return el("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",background:"#f1f5f9",borderRadius:"16px",padding:"5px",marginBottom:"18px"}},opts.map(function(o){
+    var on=S.memoMode===o[0];var night=o[0]==="audio";
+    return el("button",{style:{borderRadius:"12px",padding:"10px 6px",background:on?(night?"linear-gradient(135deg,#1e1b4b,#312e81)":"#fff"):"transparent",color:on?(night?"#fde68a":"#0d9488"):"#94a3b8",boxShadow:on?"0 2px 8px rgba(0,0,0,.12)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:"2px"},onClick:function(){setMemoMode(o[0])}},[
+      el("div",{style:{fontSize:"15px",fontWeight:"800"}},o[1]+" "+o[2]),
+      el("div",{style:{fontSize:"10px",opacity:"0.8",fontWeight:"600"}},o[3])
+    ]);
+  }));
+}
 function renderApiKey(){
   var kv=APIKEY;
   var inp=el("input",{className:"inp",type:"password",placeholder:"sk-ant-...",value:kv,style:{marginBottom:"12px"}});
@@ -520,7 +804,7 @@ function renderHome(){
   ]);
   var menus=[
     {icon:"✏️",bg:"#eef2ff",label:"테스트 시작",sub:"오늘 복습할 "+stats.dueToday+"문제",fn:function(){set({screen:"subjectStudy"})}},
-    {icon:"🔖",bg:"#f0fdf4",label:"플래시카드 학습",sub:"전체 "+stats.total+"개 카드 암기",fn:function(){set({screen:"subjectMemo"})}},
+    {icon:"🔖",bg:"#f0fdf4",label:"플래시카드 학습",sub:"전체 "+stats.total+"개 카드 · ☀️ 텍스트 / 🌙 오디오",fn:function(){set({screen:"subjectMemo"})}},
     {icon:"➕",bg:"#fdf4ff",label:"퀴즈 생성",sub:"문제 추가·수정·가져오기",fn:function(){set({screen:"manage"})}},
     {icon:"📊",bg:"#fffbeb",label:"학습 기록",sub:"캘린더·통계·오답 분석",fn:function(){set({screen:"stats"})}}
   ];
@@ -845,7 +1129,7 @@ function render(){
     subjectStudy:function(){return renderSubjectSelect("study")},
     subjectMemo:function(){return renderSubjectSelect("memo")},
     study:renderStudy,memo:renderMemo,
-    add:renderAddEdit,manage:renderManage,stats:renderStats,done:renderDone
+    add:renderAddEdit,manage:renderManage,stats:renderStats,done:renderDone,audio:renderAudio
   };
   var fn=screens[S.screen];if(fn)app.appendChild(fn());
 }

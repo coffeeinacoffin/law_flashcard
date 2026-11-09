@@ -211,7 +211,7 @@ function sm2(correct,interval,ef){
 // ── Azure TTS
 var AZURE_KEY_STORE="law_fc_azure_key",AZURE_REGION_STORE="law_fc_azure_region";
 var AZURE_KEY=(function(){try{return localStorage.getItem(AZURE_KEY_STORE)||""}catch(e){return""}})();
-var AZURE_REGION=(function(){try{return localStorage.getItem(AZURE_REGION_STORE)||"koreacentral"}catch(e){return"koreacentral"}})();
+var AZURE_REGION=(function(){try{return localStorage.getItem(AZURE_REGION_STORE)||"eastasia"}catch(e){return"eastasia"}})();
 var _azureAudio=null;
 function speak(text){
   if(_azureAudio){_azureAudio.pause();_azureAudio=null;}
@@ -334,12 +334,17 @@ function startStudy(subject,starOnly){
   if(!cards.length){toast(starOnly?"⭐ 북마크된 복습 문제가 없습니다!":"🎉 오늘 "+subject+" 복습할 문제가 없습니다!");return}
   set({screen:"study",session:{cards:cards,idx:0,answered:false,judging:false,result:null,confirmed:false,finalCorrect:null,showHint:false,userInput:"",sessionCorrect:0,subject:subject,starOnly:!!starOnly}});
 }
-function startMemo(subject,starOnly){
-  var pool=S.cards.filter(function(c){return(c.subject||"민법")===subject});
-  if(starOnly)pool=pool.filter(function(c){return c.starred});
+function asSubjects(s){return Array.isArray(s)?s:[s]}
+function poolFor(subjects,starOnly){
+  subjects=asSubjects(subjects);
+  return S.cards.filter(function(c){return subjects.indexOf(c.subject||"민법")>=0&&(!starOnly||c.starred)});
+}
+function startMemo(subjects,starOnly){
+  subjects=asSubjects(subjects);
+  var pool=poolFor(subjects,starOnly);
   if(!pool.length){toast(starOnly?"⭐ 북마크된 카드가 없습니다!":"문제가 없습니다.");return}
-  pool.sort(function(){return Math.random()-.5});
-  set({screen:"memo",memo:{cards:pool,idx:0,flipped:false,subject:subject,starOnly:!!starOnly}});
+  pool=shuffleArr(pool);
+  set({screen:"memo",memo:{cards:pool,idx:0,flipped:false,subjects:subjects,starOnly:!!starOnly}});
   setTimeout(function(){speak(pool[0].question)},400);
 }
 function submitAnswer(){
@@ -440,6 +445,7 @@ function ghostBtn(t,fn,ex){return el("button",{style:Object.assign({background:"
 
 // ── 과목 선택 화면 (테스트/암기 공통)
 function renderSubjectSelect(mode){
+  if(mode==="memo")return renderMemoSelect();
   var stats=calcStats();
   var title=mode==="study"?"✏️ 테스트 시작":"🔖 플래시카드 학습";
   var subjBtns=el("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px",marginBottom:"16px"}},
@@ -577,11 +583,11 @@ function unlockAudio(){try{if(!AO.src||AO.dataset.kind!=="main"){AO.dataset.kind
 function fmtTime(s){s=Math.max(0,Math.round(s));var m=Math.floor(s/60),x=s%60;return m+":"+String(x).padStart(2,"0")}
 function shuffleArr(a){a=a.slice();for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t}return a}
 
-function startAudio(subject,starOnly){
-  var pool=S.cards.filter(function(c){return(c.subject||"민법")===subject});
-  if(starOnly)pool=pool.filter(function(c){return c.starred});
+function startAudio(subjects,starOnly){
+  subjects=asSubjects(subjects);
+  var pool=poolFor(subjects,starOnly);
   if(!pool.length){toast(starOnly?"⭐ 북마크된 카드가 없습니다!":"문제가 없습니다.");return}
-  set({screen:"audio",audio:{subject:subject,starOnly:!!starOnly,pool:pool,state:"setup",run:0}});
+  set({screen:"audio",audio:{subjects:subjects,starOnly:!!starOnly,pool:pool,state:"setup",run:0}});
 }
 function stopAudioPlayback(){
   try{AO.pause()}catch(e){}
@@ -658,7 +664,7 @@ function setupAudioSession(){
 function updateAudioMeta(){
   var A=S.audio;if(!A||!("mediaSession"in navigator)||typeof MediaMetadata==="undefined")return;
   var seg=A.segs&&A.cur>=0?A.segs[A.cur]:null;
-  try{navigator.mediaSession.metadata=new MediaMetadata({title:seg?ttsClean(seg.card.question).slice(0,80):"🌙 audio only",artist:SUBJ_ICON[A.subject]+" "+A.subject+(seg?" · "+(A.cur+1)+"번째":""),album:"법학 플래시카드"})}catch(e){}
+  try{navigator.mediaSession.metadata=new MediaMetadata({title:seg?ttsClean(seg.card.question).slice(0,80):"🌙 audio only",artist:(seg?(SUBJ_ICON[seg.card.subject]||"")+" "+(seg.card.subject||""):A.subjects.join("·"))+(seg?" · "+(A.cur+1)+"번째":""),album:"법학 플래시카드"})}catch(e){}
 }
 function updateAudioDom(){
   var A=S.audio;if(!A||S.screen!=="audio"||!A.segs)return;
@@ -677,7 +683,7 @@ AO.addEventListener("ended",function(){if(AO.dataset.kind==="main"&&S.audio){S.a
 
 // ── 🌙 화면
 function renderAudio(){
-  var A=S.audio;var sc=SUBJ_COLOR[A.subject]||["#fff","#333"];
+  var A=S.audio;var one=A.subjects.length===1;var sc=one?SUBJ_COLOR[A.subjects[0]]:["#ede9fe","#4c1d95"];
   var W="rgba(255,255,255,";
   var chipRow=function(label,key,vals,fmt){
     return el("div",{style:{marginBottom:"14px"}},[
@@ -691,7 +697,7 @@ function renderAudio(){
   var top=el("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"18px"}},[
     ghostBtn("✕ 종료",exitAudio),
     el("div",{style:{display:"flex",alignItems:"center",gap:"6px"}},[
-      el("span",{style:{background:sc[0],color:sc[1],fontSize:"11px",fontWeight:"700",padding:"3px 10px",borderRadius:"99px"}},SUBJ_ICON[A.subject]+" "+A.subject+(A.starOnly?" ⭐":"")),
+      el("span",{style:{background:sc[0],color:sc[1],fontSize:"11px",fontWeight:"700",padding:"3px 10px",borderRadius:"99px"}},(one?SUBJ_ICON[A.subjects[0]]+" "+A.subjects[0]:A.subjects.map(function(s){return SUBJ_ICON[s]}).join(" ")+" "+A.subjects.length+"과목")+(A.starOnly?" ⭐":"")),
       el("span",{style:{color:W+".7)",fontSize:"12px",fontWeight:"700"}},"🌙 audio only")
     ])
   ]);
@@ -752,6 +758,46 @@ function renderAudio(){
   return div("page",[el("div",{style:{width:"100%",maxWidth:"480px",margin:"auto"}},[top,body])],{background:"linear-gradient(160deg,#0b1026,#1e1b4b 60%,#312e81)"});
 }
 
+// ── 플래시카드 학습: 과목 여러 개 선택
+var MEMO_SEL_KEY="law_fc_memo_sel";
+S.memoSel=(function(){try{var a=JSON.parse(localStorage.getItem(MEMO_SEL_KEY)||"null");if(Array.isArray(a))return a.filter(function(s){return SUBJECTS.indexOf(s)>=0})}catch(e){}return SUBJECTS.slice()})();
+S.memoStar=(function(){try{return localStorage.getItem(MEMO_SEL_KEY+"_star")==="1"}catch(e){return false}})();
+function saveMemoSel(){try{localStorage.setItem(MEMO_SEL_KEY,JSON.stringify(S.memoSel));localStorage.setItem(MEMO_SEL_KEY+"_star",S.memoStar?"1":"0")}catch(e){}}
+function renderMemoSelect(){
+  var audio=S.memoMode==="audio";
+  var subjBtns=el("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px",marginBottom:"12px"}},
+    SUBJECTS.map(function(s){
+      var sc=SUBJ_COLOR[s];var on=S.memoSel.indexOf(s)>=0;
+      var all=S.cards.filter(function(c){return(c.subject||"민법")===s});
+      var stars=all.filter(function(c){return c.starred}).length;
+      return el("button",{className:"subj-btn",style:{background:on?sc[0]:"#f8fafc",color:on?sc[1]:"#94a3b8",cursor:"pointer",border:"2px solid "+(on?sc[1]:"#e2e8f0"),position:"relative"},onClick:function(){
+        if(on)S.memoSel=S.memoSel.filter(function(x){return x!==s});else S.memoSel=SUBJECTS.filter(function(x){return x===s||S.memoSel.indexOf(x)>=0});
+        saveMemoSel();render();
+      }},[
+        el("div",{style:{position:"absolute",top:"8px",right:"10px",fontSize:"13px",fontWeight:"800"}},on?"✓":""),
+        el("div",{style:{fontSize:"28px",filter:on?"none":"grayscale(1)",opacity:on?"1":".5"}},SUBJ_ICON[s]),
+        el("div",{style:{fontSize:"15px",fontWeight:"800"}},s),
+        el("div",{style:{fontSize:"11px",opacity:"0.8"}},"전체 "+all.length+"개"+(stars?" · ⭐"+stars:""))
+      ]);
+    })
+  );
+  var starBtn=el("button",{style:{width:"100%",padding:"11px",borderRadius:"12px",fontSize:"13px",fontWeight:"700",marginBottom:"14px",background:S.memoStar?"#fef3c7":"#fff",color:S.memoStar?"#b45309":"#64748b",border:"1px solid "+(S.memoStar?"#fcd34d":"#e2e8f0")},onClick:function(){S.memoStar=!S.memoStar;saveMemoSel();render()}},(S.memoStar?"✓ ":"")+"⭐ 북마크한 카드만");
+  var n=poolFor(S.memoSel,S.memoStar).length;
+  var go=function(){if(!S.memoSel.length){toast("과목을 하나 이상 선택하세요");return}if(audio)startAudio(S.memoSel,S.memoStar);else startMemo(S.memoSel,S.memoStar)};
+  var startBtn=btn((audio?"🌙 듣기 시작":"☀️ 학습 시작")+" · "+n+"장",n?(audio?"linear-gradient(135deg,#1e1b4b,#312e81)":"#0d9488"):"#cbd5e1",audio&&n?"#fde68a":"#fff",go,{borderRadius:"14px",fontSize:"15px"});
+  var card=div("card",[
+    el("div",{style:{display:"flex",alignItems:"center",gap:"10px",marginBottom:"20px"}},[
+      el("button",{style:{background:"#f1f5f9",border:"none",borderRadius:"10px",padding:"8px 14px",fontSize:"13px",fontWeight:"700",cursor:"pointer"},onClick:function(){set({screen:"home"})}},"← 뒤로"),
+      el("h2",{style:{fontSize:"18px",fontWeight:"800",color:"#1e293b",flex:"1"}},"🔖 플래시카드 학습")
+    ]),
+    renderMemoModeToggle(),
+    p("과목을 선택하세요 (여러 개 가능)",{fontSize:"13px",color:"#64748b",marginBottom:"14px"}),
+    subjBtns,starBtn,startBtn
+  ]);
+  card.style.maxWidth="480px";card.style.margin="auto";
+  return div("page gbg",[card]);
+}
+
 // ── 화면들
 function renderMemoModeToggle(){
   var opts=[["text","☀️","with text","카드 보면서 학습"],["audio","🌙","audio only","화면 끄고 듣기"]];
@@ -769,7 +815,7 @@ function renderApiKey(){
   inp.addEventListener("input",function(e){kv=e.target.value});
   var azInp=el("input",{className:"inp",type:"password",placeholder:"Azure Speech 키 1",value:az,style:{marginBottom:"8px"}});
   azInp.addEventListener("input",function(e){az=e.target.value});
-  var arInp=el("input",{className:"inp",type:"text",placeholder:"지역 (예: koreacentral)",value:ar,style:{marginBottom:"6px"}});
+  var arInp=el("input",{className:"inp",type:"text",placeholder:"지역 (예: eastasia)",value:ar,style:{marginBottom:"6px"}});
   arInp.addEventListener("input",function(e){ar=e.target.value});
   var azSection=el("div",{style:{borderTop:"1px solid #f1f5f9",paddingTop:"16px",marginBottom:"16px"}},[
     p("🔊 Azure 음성 키 (읽어주기 · 🌙 audio only)",{fontSize:"13px",fontWeight:"700",color:"#1e293b",marginBottom:"8px"}),
@@ -783,7 +829,7 @@ function renderApiKey(){
     azSection,
     btn("저장 후 시작","#4f46e5","#fff",function(){
       APIKEY=kv.trim();localStorage.setItem(APIKEY_STORE,APIKEY);
-      AZURE_KEY=az.trim();AZURE_REGION=(ar.trim()||"koreacentral").toLowerCase().replace(/\s+/g,"");
+      AZURE_KEY=az.trim();AZURE_REGION=(ar.trim()||"eastasia").toLowerCase().replace(/\s+/g,"");
       try{localStorage.setItem(AZURE_KEY_STORE,AZURE_KEY);localStorage.setItem(AZURE_REGION_STORE,AZURE_REGION)}catch(e){}
       _azTok=null;set({screen:"home"})},{borderRadius:"14px"})
   ]);
@@ -901,7 +947,7 @@ function renderStudy(){
 
 function renderMemo(){
   var m=S.memo;var card=m.cards[m.idx];var total=m.cards.length;
-  var sc=SUBJ_COLOR[m.subject||"민법"];
+  var cs=card.subject||"민사법";var sc=SUBJ_COLOR[cs]||["#f1f5f9","#374151"];
   var exit=function(){if(_azureAudio){_azureAudio.pause();_azureAudio=null;}try{window.speechSynthesis&&window.speechSynthesis.cancel()}catch(e){}set({screen:"home"});};
   var goNext=function(){if(_azureAudio){_azureAudio.pause();_azureAudio=null;}try{window.speechSynthesis&&window.speechSynthesis.cancel()}catch(e){}var ni=(m.idx+1)%total;m.idx=ni;m.flipped=false;render();setTimeout(function(){speak(m.cards[ni].question)},200);};
   var goPrev=function(){if(_azureAudio){_azureAudio.pause();_azureAudio=null;}try{window.speechSynthesis&&window.speechSynthesis.cancel()}catch(e){}var pi=(m.idx-1+total)%total;m.idx=pi;m.flipped=false;render();setTimeout(function(){speak(m.cards[pi].question)},200);};
@@ -921,7 +967,7 @@ function renderMemo(){
     el("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"16px"}},[
       ghostBtn("✕ 종료",exit),
       el("div",{style:{display:"flex",alignItems:"center",gap:"6px"}},[
-        el("span",{style:{background:sc[0],color:sc[1],fontSize:"11px",fontWeight:"700",padding:"3px 10px",borderRadius:"99px"}},SUBJ_ICON[m.subject]+" "+m.subject),
+        el("span",{style:{background:sc[0],color:sc[1],fontSize:"11px",fontWeight:"700",padding:"3px 10px",borderRadius:"99px"}},(SUBJ_ICON[cs]||"")+" "+cs),
         el("span",{style:{color:"rgba(255,255,255,.8)",fontSize:"13px"}},(m.idx+1)+" / "+total)
       ]),
       ghostBtn("🔊 읽기",function(){speak(m.flipped?card.answer:card.question)})

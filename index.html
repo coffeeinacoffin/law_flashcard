@@ -209,12 +209,14 @@ function sm2(correct,interval,ef){
 }
 
 // ── Azure TTS
-var AZURE_KEY="78koQ85nl8rjm4CvwcvCISOPKL9CE9UrO7SCF4huAHKoV1OaCrk3JQQJ99CEACNns7RXJ3w3AAAYACOGcsj3";
-var AZURE_REGION="koreacentral";
+var AZURE_KEY_STORE="law_fc_azure_key",AZURE_REGION_STORE="law_fc_azure_region";
+var AZURE_KEY=(function(){try{return localStorage.getItem(AZURE_KEY_STORE)||""}catch(e){return""}})();
+var AZURE_REGION=(function(){try{return localStorage.getItem(AZURE_REGION_STORE)||"koreacentral"}catch(e){return"koreacentral"}})();
 var _azureAudio=null;
 function speak(text){
   if(_azureAudio){_azureAudio.pause();_azureAudio=null;}
   try{window.speechSynthesis&&window.speechSynthesis.cancel()}catch(e){}
+  if(!AZURE_KEY){fallbackSpeak(text);return;}
   var xhr=new XMLHttpRequest();
   xhr.open("POST","https://"+AZURE_REGION+".api.cognitive.microsoft.com/sts/v1.0/issueToken",true);
   xhr.setRequestHeader("Ocp-Apim-Subscription-Key",AZURE_KEY);
@@ -512,9 +514,10 @@ function ssmlText(s){return escXml(s).replace(/\n+/g,'<break time="400ms"/>')}
 // ── Azure (토큰 재사용)
 var _azTok=null,_azTokAt=0;
 async function azureToken(){
+  if(!AZURE_KEY)throw new Error("Azure 키가 없어요 — 홈 화면 아래 '🔑 API 키 변경'에서 넣어 주세요");
   if(_azTok&&Date.now()-_azTokAt<8*60*1000)return _azTok;
   var r=await fetch("https://"+AZURE_REGION+".api.cognitive.microsoft.com/sts/v1.0/issueToken",{method:"POST",headers:{"Ocp-Apim-Subscription-Key":AZURE_KEY}});
-  if(!r.ok)throw new Error("Azure 인증 실패 ("+r.status+")");
+  if(!r.ok)throw new Error(r.status===401||r.status===403?"Azure 키 또는 지역이 맞지 않아요 ("+r.status+") — 홈 화면 아래 '🔑 API 키 변경'에서 확인해 주세요":"Azure 인증 실패 ("+r.status+")");
   _azTok=await r.text();_azTokAt=Date.now();return _azTok;
 }
 async function azureSynth(inner,rate){
@@ -761,14 +764,28 @@ function renderMemoModeToggle(){
   }));
 }
 function renderApiKey(){
-  var kv=APIKEY;
+  var kv=APIKEY,az=AZURE_KEY,ar=AZURE_REGION;
   var inp=el("input",{className:"inp",type:"password",placeholder:"sk-ant-...",value:kv,style:{marginBottom:"12px"}});
   inp.addEventListener("input",function(e){kv=e.target.value});
+  var azInp=el("input",{className:"inp",type:"password",placeholder:"Azure Speech 키 1",value:az,style:{marginBottom:"8px"}});
+  azInp.addEventListener("input",function(e){az=e.target.value});
+  var arInp=el("input",{className:"inp",type:"text",placeholder:"지역 (예: koreacentral)",value:ar,style:{marginBottom:"6px"}});
+  arInp.addEventListener("input",function(e){ar=e.target.value});
+  var azSection=el("div",{style:{borderTop:"1px solid #f1f5f9",paddingTop:"16px",marginBottom:"16px"}},[
+    p("🔊 Azure 음성 키 (읽어주기 · 🌙 audio only)",{fontSize:"13px",fontWeight:"700",color:"#1e293b",marginBottom:"8px"}),
+    azInp,arInp,
+    p("Azure 포털 → 음성 리소스 → 키 및 엔드포인트. 이 기기에만 저장돼요.",{fontSize:"11px",color:"#94a3b8"})
+  ]);
   var card=div("card card-sm",[
     el("div",{style:{textAlign:"center",marginBottom:"20px"}},[p("🔑",{fontSize:"44px",marginBottom:"8px"}),el("h2",{style:{fontSize:"20px",fontWeight:"700",color:"#1e293b"}},"API 키 설정"),p("Anthropic API 키를 입력하세요 (AI 채점용)",{color:"#64748b",fontSize:"13px",marginTop:"4px"})]),
     inp,
     el("a",{href:"https://console.anthropic.com/",target:"_blank",style:{fontSize:"11px",color:"#6366f1",display:"block",marginBottom:"16px"}},"API 키 발급하기 →"),
-    btn("저장 후 시작","#4f46e5","#fff",function(){APIKEY=kv;localStorage.setItem(APIKEY_STORE,kv);set({screen:"home"})},{borderRadius:"14px"})
+    azSection,
+    btn("저장 후 시작","#4f46e5","#fff",function(){
+      APIKEY=kv.trim();localStorage.setItem(APIKEY_STORE,APIKEY);
+      AZURE_KEY=az.trim();AZURE_REGION=(ar.trim()||"koreacentral").toLowerCase().replace(/\s+/g,"");
+      try{localStorage.setItem(AZURE_KEY_STORE,AZURE_KEY);localStorage.setItem(AZURE_REGION_STORE,AZURE_REGION)}catch(e){}
+      _azTok=null;set({screen:"home"})},{borderRadius:"14px"})
   ]);
   card.style.marginTop="60px";
   return div("page gbg",[card]);
